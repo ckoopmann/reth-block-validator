@@ -1,16 +1,20 @@
+use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
 use derivative::Derivative;
-use reth::primitives::{Address, Bloom, Bytes, B256, U256};
 use reth::rpc::types::{
-    ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3, Withdrawal,
+    engine::{
+        BlobsBundleV1, ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
+    },
+    Withdrawal,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 
 #[serde_as]
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(missing_docs)]
 pub struct ValidationRequestBody {
     pub execution_payload: ExecutionPayloadValidation,
+    pub blobs_bundle: BlobsBundleV1,
     pub message: BidTrace,
     pub signature: Bytes,
     #[serde_as(as = "DisplayFromStr")]

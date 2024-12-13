@@ -13,9 +13,39 @@
 //! curl --location 'localhost:8545/' --header 'Content-Type: application/json' --data @test/data/rpc_payload.json
 //! ```
 use clap::Parser;
-use reth::cli::Cli;
-use reth_payload_validator::ValidationCliExt;
+use reth::{chainspec::EthereumChainSpecParser, cli::Cli};
+use reth_node_ethereum::EthereumNode;
+use rpc::{ValidationRpcExt, ValidationRpcExtApiServer};
+
+mod rpc;
 
 fn main() {
-    Cli::<ValidationCliExt>::parse().run().unwrap();
+    Cli::<EthereumChainSpecParser, RethCliValidationExt>::parse()
+        .run(|builder, args| async move {
+            let handle = builder
+                .node(EthereumNode::default())
+                .extend_rpc_modules(move |ctx| {
+                    if !args.enable_ext {
+                        return Ok(());
+                    }
+                    let provider = ctx.provider().clone();
+                    let ext = ValidationRpcExt { provider };
+                    ctx.modules.merge_configured(ext.into_rpc())?;
+
+                    Ok(())
+                })
+                .launch()
+                .await?;
+
+            handle.wait_for_node_exit().await
+        })
+        .unwrap();
+}
+
+/// Our custom cli args extension that adds one flag to reth default CLI.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
+struct RethCliValidationExt {
+    /// CLI flag to enable the txpool extension namespace
+    #[arg(long)]
+    pub enable_ext: bool,
 }
