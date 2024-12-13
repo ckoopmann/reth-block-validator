@@ -17,16 +17,19 @@ inherits = "release"
 debug = true
 
 [dependencies]
+alloy-primitives = "0.8.15"
 async-trait = "0.1.73"
 clap = "4.4.5"
 derivative = "2.2.0"
 eyre = "0.6.8"
 hex = "0.4.3"
-jsonrpsee = "0.20.1"
-reth = { git = "https://github.com/paradigmxyz/reth", rev = "5a623a9c1285d986fc46f1091d58d7a388323457" }
-reth-db = { features = ["test-utils"], git = "https://github.com/paradigmxyz/reth", rev = "5a623a9c1285d986fc46f1091d58d7a388323457"}
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "5a623a9c1285d986fc46f1091d58d7a388323457"}
-secp256k1 = { version = "0.28.0", features = ["rand-std"] }
+jsonrpsee = "0.24.7"
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.2", package = "reth" }
+reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.2", package = "reth-db" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.2", package = "reth-evm" }
+reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.2", package = "reth-ethereum-forks" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.2", package = "reth-node-ethereum" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.2", package = "reth-tracing" }
 serde = "1.0.188"
 serde_json = "1.0.107"
 serde_with = "3.3.0"

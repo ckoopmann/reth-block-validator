@@ -1,21 +1,33 @@
-use crate::rpc::result::internal_rpc_err;
+use alloy_primitives::{keccak256, Address, B256, U256};
+use jsonrpsee::core::RpcResult;
+use reth::{
+    beacon_consensus::EthBeaconConsensus,
+    chainspec::HOLESKY,
+    consensus::Consensus,
+    primitives::{Receipts, SealedBlock, TransactionSigned},
+    providers::{
+        AccountReader, BlockExecutionInput, BlockReaderIdExt, ChainSpecProvider, ExecutionOutcome,
+        HeaderProvider, StateProviderFactory, WithdrawalsProvider,
+    },
+    revm::{database::StateProviderDatabase, db::BundleState},
+    rpc::{
+        compat::engine::payload::try_into_sealed_block,
+        result::ToRpcResult,
+        types::{
+            engine::{BlobsBundleV1, CancunPayloadFields, ExecutionPayloadSidecar},
+            TransactionTrait,
+        },
+    },
+};
+use reth_evm::execute::{BatchExecutor, BlockExecutorProvider};
+use reth_node_ethereum::EthExecutorProvider;
+use reth_tracing::tracing;
+use std::{sync::Arc, time::Instant};
+use uuid::Uuid;
+
+use super::result::internal_rpc_err;
 use crate::rpc::types::*;
 use crate::rpc::utils::*;
-use jsonrpsee::core::RpcResult;
-use reth::consensus_common::validation::full_validation;
-use reth::primitives::{
-    revm_primitives::AccountInfo, Address, Receipts, SealedBlock, TransactionSigned, U256,
-};
-use reth::providers::{
-    AccountReader, BlockExecutor, BlockReaderIdExt, BundleStateWithReceipts, ChainSpecProvider,
-    HeaderProvider, StateProviderFactory, WithdrawalsProvider,
-};
-use reth::revm::{database::StateProviderDatabase, db::BundleState, processor::EVMProcessor};
-use reth::rpc::compat::engine::payload::try_into_sealed_block;
-use reth::rpc::result::ToRpcResult;
-use reth_tracing::tracing;
-use std::time::Instant;
-use uuid::Uuid;
 
 pub struct ValidationRequest<Provider> {
     request_id: Uuid,
@@ -139,23 +151,36 @@ where
     }
 
     fn parse_block(&self) -> RpcResult<SealedBlock> {
-        try_into_sealed_block(
-            self.request_body.execution_payload.clone().into(),
-            self.request_body.parent_beacon_block_root,
-        )
-        .to_rpc_result()
+        let sidecar = ExecutionPayloadSidecar::v3(CancunPayloadFields {
+            parent_beacon_block_root: self.request_body.parent_beacon_block_root.unwrap(),
+            versioned_hashes: get_blob_versioned_hashes(&self.request_body.blobs_bundle),
+        });
+
+        try_into_sealed_block(self.request_body.execution_payload.clone().into(), &sidecar)
+            .to_rpc_result()
     }
 
     fn validate_header(&self, block: &SealedBlock) -> RpcResult<()> {
-        full_validation(block, &self.provider, &self.provider.chain_spec()).to_rpc_result()
+        let consensus = Arc::new(EthBeaconConsensus::new(HOLESKY.clone()));
+
+        consensus
+            .validate_header(block)
+            .map_err(|e| internal_rpc_err(format!("Error validating header: {:}", e)))?;
+
+        consensus
+            .validate_block_pre_execution(block)
+            .map_err(|e| internal_rpc_err(format!("Error validating block: {:}", e)))?;
+
+        Ok(())
     }
 
-    fn execute_and_verify_block(&self, block: &SealedBlock) -> RpcResult<BundleStateWithReceipts> {
-        let chain_spec = self.provider.chain_spec();
+    fn execute_and_verify_block(&self, block: &SealedBlock) -> RpcResult<ExecutionOutcome> {
         let state_provider = self.provider.latest().to_rpc_result()?;
+        // TODO: figure out spec
+        let executor_provider = EthExecutorProvider::ethereum(HOLESKY.clone());
 
         let mut executor =
-            EVMProcessor::new_with_db(chain_spec, StateProviderDatabase::new(&state_provider));
+            executor_provider.batch_executor(StateProviderDatabase::new(&state_provider));
 
         let unsealed_block =
             block
@@ -165,46 +190,52 @@ where
                 .ok_or(internal_rpc_err(
                     "Error recovering senders from block, cannot execute block",
                 ))?;
-        // Note: Setting total difficulty to U256::MAX makes this incompatible with pre merge POW
-        // blocks
+
+        // Note: Setting total difficulty to U256::MAX makes this incompatible with pre merge POW blocks
+        let input = BlockExecutionInput {
+            block: &unsealed_block,
+            total_difficulty: U256::MAX,
+        };
+
         executor
-            .execute_and_verify_receipt(&unsealed_block, U256::MAX)
+            .execute_and_verify_one(input)
             .map_err(|e| internal_rpc_err(format!("Error executing transactions: {:}", e)))?;
 
-        Ok(executor.take_output_state())
+        let outcome = executor.finalize();
+
+        Ok(outcome)
     }
 
-    fn verify_state_root(
-        &self,
-        block: &SealedBlock,
-        state: &BundleStateWithReceipts,
-    ) -> RpcResult<()> {
+    fn verify_state_root(&self, block: &SealedBlock, outcome: &ExecutionOutcome) -> RpcResult<()> {
         let state_provider = self.provider.latest().to_rpc_result()?;
         let state_root = state_provider
-            .state_root(state)
+            .state_root(outcome.hash_state_slow())
             .map_err(|e| internal_rpc_err(format!("Error computing state root: {e:?}")))?;
+
         if state_root != block.state_root {
             return Err(internal_rpc_err(format!(
                 "State root mismatch. Expected: {}. Received: {}",
                 state_root, block.state_root
             )));
         }
+
         Ok(())
     }
 
     fn check_proposer_payment(
         &self,
         block: &SealedBlock,
-        state: &BundleStateWithReceipts,
+        state: &ExecutionOutcome,
     ) -> RpcResult<()> {
         let expected_payment = &self.request_body.message.value;
         let fee_recipient = &self.request_body.message.proposer_fee_recipient;
+
         if check_proposer_balance_change(state.state(), fee_recipient, expected_payment) {
             return Ok(());
         }
 
         check_proposer_payment_in_last_transaction(
-            &block.body,
+            &block.body.transactions[..],
             state.receipts(),
             fee_recipient,
             expected_payment,
@@ -224,6 +255,7 @@ where
                 "Parent block with hash {} not found",
                 parent_hash
             )))?;
+
         tracing::debug!(request_id=self.request_id.to_string(), parent_hash = %parent_hash, parent_gas_limit = parent.gas_limit, registered_gas_limit = registered_gas_limit, block_gas_limit = block_gas_limit, "Checking gas limit");
 
         // Prysm has a bug where it registers validators with a desired gas limit
@@ -239,11 +271,14 @@ where
             return Ok(());
         }
         let calculated_gas_limit = calc_gas_limit(parent.gas_limit, registered_gas_limit);
+
         if calculated_gas_limit == block_gas_limit {
             tracing::debug!(request_id=self.request_id.to_string(), parent_hash = %parent_hash, ?registered_gas_limit, ?block_gas_limit, "Registered gas limit > 0, Correct gas limit set");
             return Ok(());
         }
+
         tracing::debug!(request_id=self.request_id.to_string(), parent_hash = %parent_hash, ?registered_gas_limit, ?block_gas_limit, ?calculated_gas_limit, "Incorrect gas limit set");
+
         Err(internal_rpc_err(format!(
             "Incorrect gas limit set, expected: {}, got: {}",
             calculated_gas_limit, block_gas_limit
@@ -321,10 +356,22 @@ fn check_proposer_balance_change(
         Some(account) => account,
         None => return false,
     };
-    let fee_receiver_account_before = match fee_receiver_account_state.original_info.clone() {
-        Some(account) => account,
-        None => AccountInfo::default(), // TODO: In tests with the MockProvider this was None by default, check if this fallback is needed in production
-    };
+    let fee_receiver_account_before = fee_receiver_account_state
+        .original_info
+        .clone()
+        .unwrap_or_default();
 
     fee_receiver_account_after.balance >= (fee_receiver_account_before.balance + expected_payment)
+}
+
+fn get_blob_versioned_hashes(bundle: &BlobsBundleV1) -> Vec<B256> {
+    bundle
+        .commitments
+        .iter()
+        .map(|commitment| {
+            let mut bytes = vec![1]; // 0x01 prefix
+            bytes.extend_from_slice(commitment.as_ref());
+            keccak256(bytes)
+        })
+        .collect()
 }
